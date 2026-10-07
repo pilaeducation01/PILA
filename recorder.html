@@ -1,0 +1,300 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>IELTS Speaking Test</title>
+<style>
+*{box-sizing:border-box}
+body{margin:0;font-family:-apple-system,"Segoe UI",Roboto,Arial,sans-serif;background:#f3f5f9;color:#1f2937;font-size:16px}
+.wrap{max-width:760px;margin:0 auto;padding:22px}
+.top{display:flex;justify-content:space-between;align-items:center;margin-bottom:16px;gap:12px}
+.brand{font-weight:800;font-size:18px;color:#14284b}
+.timer{font-size:28px;font-weight:800;font-variant-numeric:tabular-nums}
+.card{background:#fff;border:1px solid #dfe3ea;border-radius:14px;padding:24px;box-shadow:0 1px 3px rgba(16,24,40,.05)}
+.muted{color:#6b7280}
+h2{margin:0 0 10px}
+.btn{border:0;border-radius:8px;padding:13px 26px;font-size:16px;font-weight:700;cursor:pointer;background:#1a73e8;color:#fff;margin-top:16px}
+.btn:disabled{opacity:.5;cursor:not-allowed}
+.btn.sec{background:#e5e8ee;color:#222;margin-left:8px}
+.msg{margin:14px 0;padding:12px 14px;border-radius:8px;background:#e8f0fe;color:#174ea6;line-height:1.55}
+.msg.err{background:#fdecea;color:#b3261e}.msg.ok{background:#e6f4ea;color:#137333}
+.cue{white-space:pre-wrap;line-height:1.7;font-size:19px;border:2px solid #14284b;border-radius:12px;padding:20px;background:#fff}
+.meter{height:10px;background:#e5e8ee;border-radius:99px;overflow:hidden;margin:12px 0}
+.meter>div{height:10px;width:0;background:#2f855a;transition:width .08s}
+.recdot{display:inline-block;width:12px;height:12px;border-radius:50%;background:#d93025;margin-right:8px;animation:blink 1s infinite}
+@keyframes blink{50%{opacity:.25}}
+ul{line-height:1.9;padding-left:20px}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="top"><div class="brand">IELTS Speaking Test</div><div class="timer" id="timer"></div></div>
+  <div id="app"><div class="card muted">Loading...</div></div>
+</div>
+
+<script>
+/* =========================================================
+   SETUP: paste your web app address (it ends with /exec)
+   ========================================================= */
+const API_URL = 'PASTE_YOUR_WEB_APP_URL_HERE';
+
+
+/* =========================================================
+   HELPERS
+   ========================================================= */
+const $ = id => document.getElementById(id);
+function esc(v){ return String(v === null || v === undefined ? '' : v).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'); }
+function render(html){ $('app').innerHTML = html; window.scrollTo(0,0); }
+function fmt(sec){ sec = Math.max(0, Math.round(sec)); return String(Math.floor(sec/60)).padStart(2,'0') + ':' + String(sec%60).padStart(2,'0'); }
+
+const P = new URLSearchParams(location.search);
+const SID = P.get('s') || '', UID = P.get('u') || '';
+
+let CFG = null, items = [], idx = 0;
+let stream = null, ctx = null, meterId = null;
+let rec = null, chunks = [], recStart = 0, stopped = null, mime = '';
+let uploads = [], shown = {}, busy = false, timerId = null, active = false;
+
+window.addEventListener('beforeunload', e => { if (active){ e.preventDefault(); e.returnValue = ''; } });
+
+/* The request is sent as plain text so the browser does not need a pre-flight check. */
+async function api(action, extra){
+  const body = JSON.stringify(Object.assign({ action: action, sessionId: SID, studentId: UID }, extra || {}));
+  const res = await fetch(API_URL, { method: 'POST', body: body });
+  const data = await res.json();
+  if (!data.ok) throw new Error(data.error || 'Request failed.');
+  return data;
+}
+
+function fail(msg){ render('<div class="card"><div class="msg err">' + esc(msg) + '</div></div>'); }
+
+/* =========================================================
+   START
+   ========================================================= */
+async function init(){
+  if (!SID || !UID) return fail('Please open this page from the "Open Speaking test" button on your test dashboard.');
+  if (API_URL.indexOf('PASTE') === 0) return fail('The recorder is not set up yet. Please tell your examiner.');
+
+  try { CFG = await api('config'); }
+  catch (e) { return fail('Could not load your Speaking test: ' + e.message); }
+
+  items = CFG.tasks || [];
+  if (!items.length) return fail('This test has no Speaking questions.');
+
+  const saved = CFG.saved || [];
+  saved.forEach(r => { shown[r.part] = true; });
+  idx = items.findIndex(it => !saved.some(r => r.part === it.part && r.itemNo === it.itemNo));
+
+  if (idx === -1) return finish();
+  showMic();
+}
+
+/* =========================================================
+   MICROPHONE CHECK
+   ========================================================= */
+function pickMime(){
+  if (typeof MediaRecorder === 'undefined') return null;
+  const list = ['audio/webm;codecs=opus','audio/webm','audio/mp4','audio/ogg;codecs=opus'];
+  for (let i = 0; i < list.length; i++){ if (MediaRecorder.isTypeSupported(list[i])) return list[i]; }
+  return '';
+}
+
+function showMic(){
+  mime = pickMime();
+  render('<div class="card"><h2>Hello, ' + esc(CFG.studentName || 'student') + '</h2>' +
+    '<ul><li>Your answers are <b>recorded</b> with your microphone.</li>' +
+    '<li>Each question has a timer. When it ends, the next question appears automatically.</li>' +
+    '<li>You cannot go back or repeat a question.</li>' +
+    '<li>Speak clearly in a quiet place.</li></ul>' +
+    '<div class="msg" id="micMsg">Press the button and choose <b>Allow</b> when your browser asks for the microphone.</div>' +
+    '<div class="meter"><div id="micBar"></div></div>' +
+    '<button class="btn" id="micBtn">Test microphone</button>' +
+    '<button class="btn" id="beginBtn" disabled style="margin-left:8px">' + (idx > 0 ? 'Resume Speaking' : 'Begin Speaking') + '</button></div>');
+
+  if (mime === null){
+    $('micMsg').className = 'msg err';
+    $('micMsg').textContent = 'This browser cannot record audio. Please use a recent version of Chrome, Edge, Firefox or Safari.';
+    $('micBtn').disabled = true;
+    return;
+  }
+
+  $('micBtn').onclick = async () => {
+    $('micBtn').disabled = true;
+    try {
+      stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      startMeter();
+      $('micMsg').className = 'msg ok';
+      $('micMsg').textContent = 'Microphone is working. Say a few words and check that the bar moves, then press Begin.';
+      $('beginBtn').disabled = false;
+    } catch (e) {
+      $('micBtn').disabled = false; $('micBtn').textContent = 'Try again';
+      $('micMsg').className = 'msg err';
+      $('micMsg').textContent = 'Microphone access was not allowed (' + (e && e.name ? e.name : 'error') + '). ' +
+        'Click the lock or settings icon at the left of the address bar, set Microphone to Allow, then reload this page.';
+    }
+  };
+  $('beginBtn').onclick = () => { active = true; stage(); };
+}
+
+function startMeter(){
+  try {
+    ctx = new (window.AudioContext || window.webkitAudioContext)();
+    const src = ctx.createMediaStreamSource(stream), an = ctx.createAnalyser();
+    an.fftSize = 256; src.connect(an);
+    const data = new Uint8Array(an.frequencyBinCount);
+    meterId = setInterval(() => {
+      an.getByteFrequencyData(data);
+      let sum = 0; for (let k = 0; k < data.length; k++) sum += data[k];
+      const bar = $('micBar'); if (bar) bar.style.width = Math.min(100, sum / data.length * 1.8) + '%';
+    }, 100);
+  } catch (e) {}
+}
+function stopMedia(){
+  if (meterId){ clearInterval(meterId); meterId = null; }
+  if (ctx){ try { ctx.close(); } catch (e) {} ctx = null; }
+  if (stream){ stream.getTracks().forEach(t => t.stop()); stream = null; }
+}
+
+/* =========================================================
+   TIMER
+   ========================================================= */
+function startTimer(seconds, onEnd){
+  stopTimer();
+  const end = Date.now() + seconds * 1000;
+  const tick = () => {
+    const left = Math.max(0, Math.round((end - Date.now()) / 1000));
+    $('timer').textContent = fmt(left);
+    if (left <= 0){ stopTimer(); onEnd(); }
+  };
+  tick(); timerId = setInterval(tick, 250);
+}
+function stopTimer(){ if (timerId){ clearInterval(timerId); timerId = null; } }
+
+/* =========================================================
+   QUESTIONS
+   ========================================================= */
+const PART_INTRO = {
+  1: 'Part 1 - Introduction and interview. You will be asked questions about yourself and familiar topics.',
+  2: 'Part 2 - Individual long turn. You will see a topic card. You have time to prepare, then you speak on the topic.',
+  3: 'Part 3 - Discussion. You will be asked more general questions related to the Part 2 topic.'
+};
+
+function stage(){
+  const it = items[idx];
+  if (!shown[it.part]){ shown[it.part] = true; partIntro(it); return; }
+  if (it.prepSeconds > 0) prep(it); else speak(it);
+}
+
+function head(it){
+  const inPart = items.filter(x => x.part === it.part);
+  return '<div class="muted" style="margin-bottom:8px">Part ' + it.part + ' &middot; Question ' + (inPart.indexOf(it) + 1) + ' of ' + inPart.length + '</div>';
+}
+
+function partIntro(it){
+  stopTimer(); $('timer').textContent = '';
+  const text = it.instructions ? esc(it.instructions.replace(/<[^>]+>/g, ' ')) : esc(PART_INTRO[it.part]);
+  render('<div class="card"><h2>Part ' + it.part + '</h2><div style="line-height:1.7">' + text + '</div>' +
+    '<div class="meter"><div id="micBar"></div></div><button class="btn" id="go">Start Part ' + it.part + '</button></div>');
+  $('go').onclick = () => { if (it.prepSeconds > 0) prep(it); else speak(it); };
+}
+
+function prep(it){
+  busy = false;
+  render('<div class="card">' + head(it) + '<div class="cue">' + esc(it.prompt) + '</div>' +
+    '<div class="msg"><b>Preparation time.</b> Think about what you will say. You may make notes. You are not being recorded yet.</div>' +
+    '<button class="btn" id="ready">I am ready to speak</button></div>');
+  $('ready').onclick = () => { stopTimer(); speak(it); };
+  startTimer(it.prepSeconds, () => speak(it));
+}
+
+function speak(it){
+  if (busy) return;
+  busy = true; stopTimer();
+  try { startRecording(); }
+  catch (e) { busy = false; render('<div class="card"><div class="msg err">Recording could not start: ' + esc(e.message) + '</div></div>'); return; }
+
+  render('<div class="card">' + head(it) + '<div class="cue">' + esc(it.prompt) + '</div>' +
+    '<div style="margin-top:16px;font-weight:700"><span class="recdot"></span>Recording - speak now</div>' +
+    '<div class="meter"><div id="micBar"></div></div>' +
+    '<button class="btn" id="done">Finish answer</button></div>');
+  $('done').onclick = () => endAnswer(it);
+  startTimer(it.answerSeconds, () => endAnswer(it));
+}
+
+function startRecording(){
+  chunks = [];
+  const opts = { audioBitsPerSecond: 32000 };
+  if (mime) opts.mimeType = mime;
+  rec = new MediaRecorder(stream, opts);
+  rec.ondataavailable = e => { if (e.data && e.data.size) chunks.push(e.data); };
+  recStart = Date.now();
+  stopped = new Promise(res => { rec.onstop = res; });
+  rec.start(1000);
+}
+
+async function endAnswer(it){
+  if (!busy) return;
+  busy = false; stopTimer();
+  const btn = $('done'); if (btn) btn.disabled = true;
+  if (rec && rec.state !== 'inactive') rec.stop();
+  await stopped;
+  const seconds = Math.round((Date.now() - recStart) / 1000);
+  const blob = new Blob(chunks, { type: rec.mimeType || 'audio/webm' });
+
+  const job = { it: it, blob: blob, seconds: seconds, ok: false };
+  job.promise = upload(job);
+  uploads.push(job);
+
+  idx++;
+  if (idx >= items.length) finish(); else stage();
+}
+
+/* =========================================================
+   UPLOAD AND FINISH
+   ========================================================= */
+function toDataUrl(blob){
+  return new Promise((ok, bad) => { const r = new FileReader(); r.onload = () => ok(r.result); r.onerror = () => bad(new Error('Could not read the recording.')); r.readAsDataURL(blob); });
+}
+
+async function upload(job){
+  for (let attempt = 1; attempt <= 3; attempt++){
+    try {
+      const url = await toDataUrl(job.blob);
+      await api('upload', { part: job.it.part, itemNo: job.it.itemNo, dataUrl: url, seconds: job.seconds });
+      job.ok = true; return true;
+    } catch (e) { job.error = e.message; }
+  }
+  return false;
+}
+
+async function finish(){
+  stopTimer(); $('timer').textContent = '';
+  render('<div class="card"><h2>Saving your recordings...</h2><div class="muted">Please keep this page open.</div></div>');
+  await Promise.all(uploads.map(j => j.promise));
+
+  const failed = uploads.filter(j => !j.ok);
+  if (failed.length){
+    render('<div class="card"><div class="msg err"><b>' + failed.length + ' recording(s) could not be saved.</b><br>' + esc(failed[0].error || '') + '</div>' +
+      '<button class="btn" id="retry">Try saving again</button></div>');
+    $('retry').onclick = () => { failed.forEach(j => { j.promise = upload(j); }); finish(); };
+    return;
+  }
+
+  try { await api('done'); }
+  catch (e) {
+    render('<div class="card"><div class="msg err">' + esc(e.message) + '</div><button class="btn" id="again">Try again</button></div>');
+    $('again').onclick = finish;
+    return;
+  }
+
+  active = false; stopMedia();
+  render('<div class="card"><h2>Speaking test completed</h2>' +
+    '<div class="msg ok"><b>All your answers were recorded and saved.</b></div>' +
+    '<div class="msg">You can close this tab now. Go back to your test page and press <b>Continue</b>. Your examiner will listen to your recordings and score your Speaking.</div></div>');
+}
+
+init();
+</script>
+</body>
+</html>
